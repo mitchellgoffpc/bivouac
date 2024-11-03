@@ -213,7 +213,7 @@ def train(rank, world_size, config, result_path):
             if rank == 0 and step % config.sample_every == 0:
                 val_samples_path = result_path / 'samples' / 'val'
                 val_samples_path.mkdir(parents=True, exist_ok=True)
-                torchvision.utils.save_image(torch.cat([images[:8].cpu(), reconstructions[:8].cpu()]), val_samples_path / f'{step:06d}.png', nrow=2)
+                torchvision.utils.save_image(torch.cat([images[:8].cpu(), reconstructions[:8].cpu()]), val_samples_path / f'{step:06d}.png', nrow=8)
             del images, reconstructions  # prevent OOMs on 3090/4090
 
         # Compute FID score
@@ -239,7 +239,7 @@ def train(rank, world_size, config, result_path):
         if rank == 0 and step % config.sample_every == 0:
             train_samples_path = result_path / 'samples' / 'train'
             train_samples_path.mkdir(parents=True, exist_ok=True)
-            torchvision.utils.save_image(torch.cat([images[:8].cpu(), reconstructions[:8].cpu()]), train_samples_path / f'{step:06d}.png', nrow=2)
+            torchvision.utils.save_image(torch.cat([images[:8].cpu(), reconstructions[:8].cpu()]), train_samples_path / f'{step:06d}.png', nrow=8)
         if save_experiment:
             log_values(step, {**losses, 'step_time': step_time})
         del images, reconstructions  # prevent OOMs on 3090/4090
