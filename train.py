@@ -44,7 +44,7 @@ class VQGANLossConfig:
 
 @dataclass
 class Config:
-    num_steps: int = 10000
+    num_steps: int = 1000000
     batch_size: int = 64
     micro_batch_size: int = 8
     learning_rate: float = 3.6e-5
