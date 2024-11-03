@@ -1,4 +1,9 @@
 # Adapted from https://github.com/mseitzer/pytorch-fid
+import os
+os.environ['MKL_NUM_THREADS'] = '1'  # sqrtm can be really slow without this, see https://github.com/scipy/scipy/issues/14594
+os.environ['OPENBLAS_NUM_THREADS'] = '1'
+os.environ['OMP_NUM_THREADS'] = '1'
+
 import scipy
 import torch
 import torch.nn as nn
@@ -107,6 +112,7 @@ def calculate_fid(activations1, activations2):
 # CLI tool to calculate a model's FID score
 
 def calculate_model_fid(rank, world_size):
+    import time
     import torch
     import torch.distributed as dist
     import torchvision.transforms as T
@@ -140,6 +146,7 @@ def calculate_model_fid(rank, world_size):
     inception = InceptionV3Features().to(device).eval()
 
     # Calculate activations
+    start_time = time.time()
     real_activations, recon_activations = [], []
     for images, _ in tqdm(dataloader, disable=rank != 0):
         images = images.to(device)
@@ -159,7 +166,7 @@ def calculate_model_fid(rank, world_size):
 
     if rank == 0:
         fid_score = calculate_fid(torch.cat(gathered_real), torch.cat(gathered_recon))
-        print(f"FID Score: {fid_score:.6f}")
+        print(f"FID Score: {fid_score:.6f} | Eval Time: {time.time() - start_time:.1f}s")
 
     dist.destroy_process_group()
 
