@@ -1,0 +1,11 @@
+# python
+__pycache__
+
+# outputs
+pretrained
+experiments
+data/imagenet
+data/atari
+
+# notebooks
+*.ipynb
