@@ -19,19 +19,19 @@ class VectorQuantizer(nn.Module):
 
     def forward(self, z, beta=1.0):
         B, C, H, W = z.shape
-        z = rearrange(z, 'bchw -> bhwc').contiguous()
+        z = rearrange(z, 'b c h w -> b h w c').contiguous()
         z_flattened = z.view(B*H*W, C)
 
         d = torch.sum(z_flattened ** 2, dim=1, keepdim=True) + \
             torch.sum(self.embedding.weight**2, dim=1) - 2 * \
-            torch.einsum('bd, dn -> bn', z_flattened, rearrange(self.embedding.weight, 'nd -> dn'))
+            torch.einsum('b d, d n -> b n', z_flattened, rearrange(self.embedding.weight, 'n d -> d n'))
 
         min_encoding_indices = torch.argmin(d, dim=1)
         z_q = self.embedding(min_encoding_indices).view(z.shape)
         loss = beta * torch.mean((z_q.detach()-z)**2) + torch.mean((z_q - z.detach()) ** 2)
 
         z_q = z + (z_q - z).detach()
-        z_q = rearrange(z_q, 'bhwc -> bchw').contiguous()
+        z_q = rearrange(z_q, 'b h w c -> b c h w').contiguous()
         return z_q, loss
 
 

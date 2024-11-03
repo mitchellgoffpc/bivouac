@@ -9,3 +9,6 @@ data/atari
 
 # notebooks
 *.ipynb
+
+# images
+*.png
