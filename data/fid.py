@@ -106,7 +106,7 @@ def calculate_frechet_distance(mu1, sigma1, mu2, sigma2, eps=1e-6):
 def calculate_fid(activations1, activations2):
     mu1, sigma1 = calculate_activation_statistics(activations1)
     mu2, sigma2 = calculate_activation_statistics(activations2)
-    return calculate_frechet_distance(mu1, sigma1, mu2, sigma2)
+    return calculate_frechet_distance(mu1, sigma1, mu2, sigma2).item()
 
 
 # CLI tool to calculate a model's FID score

@@ -47,7 +47,7 @@ class Config:
     num_steps: int = 1000000
     batch_size: int = 64
     micro_batch_size: int = 8
-    learning_rate: float = 3.6e-5
+    learning_rate: float = 0.000288
     weight_decay: float = 0.0
     num_workers: int = 4
     model: VQVAEConfig = field(default_factory=VQVAEConfig)
@@ -156,7 +156,7 @@ def train(rank, world_size, config, result_path):
         # generator step
         g_optimizer.zero_grad()
         for i in range(grad_accum_steps):
-            inputs = images[i*config.micro_batch_size : (i+1)*config.micro_batch_size]
+            inputs = images[i*config.micro_batch_size : (i+1)*config.micro_batch_size] * 2 - 1  # scale to [-1, 1]
             model.require_backward_grad_sync = (i == grad_accum_steps - 1)
             loss, _, sublosses = compute_g_loss(inputs)
             loss.backward()
@@ -167,7 +167,7 @@ def train(rank, world_size, config, result_path):
         # discriminator step
         d_optimizer.zero_grad()
         for i in range(grad_accum_steps):
-            inputs = images[i*config.micro_batch_size : (i+1)*config.micro_batch_size]
+            inputs = images[i*config.micro_batch_size : (i+1)*config.micro_batch_size] * 2 - 1
             discriminator.require_backward_grad_sync = (i == grad_accum_steps - 1)
             with torch.no_grad():
                 reconstructions, _ = model(inputs)
@@ -176,19 +176,22 @@ def train(rank, world_size, config, result_path):
             loss_totals['d'] = loss_totals.get('d', 0) + loss.item()
         d_optimizer.step()
 
-        return loss_totals, reconstructions
+        loss_totals = {k: all_reduce(v, device) / world_size for k,v in loss_totals.items()}
+        return loss_totals, ((reconstructions + 1) / 2).clamp(0, 1)  # scale to [0, 1]
 
     def val_step(images):
         model.eval()
         discriminator.eval()
         model.requires_grad = False
         model.module.last_layer.requires_grad = True  # for gradient computation in g_loss
+        images = images * 2 - 1
         _, reconstructions, loss_totals = compute_g_loss(images)
         loss_totals['d'] = compute_d_loss(images, reconstructions)
+        loss_totals = {k: all_reduce(v.mean().item(), device) / world_size for k,v in loss_totals.items()}
         model.requires_grad = True
-        return {k:v.mean().item() for k,v in loss_totals.items()}, reconstructions
+        return loss_totals, ((reconstructions + 1) / 2).clamp(0, 1)
 
-    def val_epoch():
+    def val_epoch(global_step):
         loss_totals = {}
         real_activations, fake_activations = [], []
 
@@ -197,12 +200,11 @@ def train(rank, world_size, config, result_path):
             start_time = time.perf_counter()
             images = images.to(device)
             losses, reconstructions = val_step(images)
-            reconstructions = ((reconstructions + 1) / 2).clamp(0, 1)  # scale to [0, 1]
             with torch.no_grad():
                 real_activations.append(inception(images).cpu())
                 fake_activations.append(inception(reconstructions).cpu())
             for key, value in losses.items():
-                loss_totals[key] = loss_totals.get(key, 0) + value
+                loss_totals[key] = (loss_totals.get(key, 0) + value) / len(val_loader)
             step_time = time.perf_counter() - start_time
 
             # Display losses and save samples
@@ -213,7 +215,7 @@ def train(rank, world_size, config, result_path):
             if rank == 0 and step % config.sample_every == 0:
                 val_samples_path = result_path / 'samples' / 'val'
                 val_samples_path.mkdir(parents=True, exist_ok=True)
-                torchvision.utils.save_image(torch.cat([images[:8].cpu(), reconstructions[:8].cpu()]), val_samples_path / f'{step:06d}.png', nrow=8)
+                torchvision.utils.save_image(torch.cat([images[:8].cpu(), reconstructions[:8].cpu()]), val_samples_path / f'step{global_step:06d}_valstep{step:06d}.png', nrow=8)
             del images, reconstructions  # prevent OOMs on 3090/4090
 
         # Compute FID score
@@ -230,18 +232,19 @@ def train(rank, world_size, config, result_path):
         # Run a single training step
         start_time = time.perf_counter()
         images, _ = next(train_loader)
-        losses, reconstructions = train_step(images.to(device))
+        train_losses, reconstructions = train_step(images.to(device))
         step_time = time.perf_counter() - start_time
 
         if rank == 0:
-            losses_str = ' | '.join(f"{k}: {v:.4f}" for k,v in losses.items())
+            losses_str = ' | '.join(f"{k}: {v:.4f}" for k,v in train_losses.items())
             print(f"step: {step:6d} | {losses_str} | dt: {step_time*1000:.1f}ms")
         if rank == 0 and step % config.sample_every == 0:
             train_samples_path = result_path / 'samples' / 'train'
             train_samples_path.mkdir(parents=True, exist_ok=True)
-            torchvision.utils.save_image(torch.cat([images[:8].cpu(), reconstructions[:8].cpu()]), train_samples_path / f'{step:06d}.png', nrow=8)
+            torchvision.utils.save_image(torch.cat([images[:8].cpu(), reconstructions[:8].cpu()]), train_samples_path / f'step{step:06d}.png', nrow=8)
         if save_experiment:
-            log_values(step, {**losses, 'step_time': step_time})
+            train_losses = {f'train_{k}': v for k,v in train_losses.items()}
+            log_values(step, {**train_losses, 'step_time': step_time})
         del images, reconstructions  # prevent OOMs on 3090/4090
 
         # Periodically compute evals
@@ -250,14 +253,15 @@ def train(rank, world_size, config, result_path):
                 print('---')
 
             start_time = time.perf_counter()
-            val_losses, fid_score = val_epoch()
+            val_losses, fid_score = val_epoch(step)
             eval_time = time.perf_counter() - start_time
 
             if rank == 0:
                 losses_str = ' | '.join(f"{k}: {v:.4f}" for k,v in val_losses.items())
                 print(f"step: {step:6d} | val {losses_str} | fid: {fid_score:.6f} | eval time: {eval_time:.1f}s\n---")
             if save_experiment:
-                log_values(step, {**val_losses, 'eval_time': eval_time})
+                val_losses = {f'val_{k}': v for k,v in val_losses.items()}
+                log_values(step, {**val_losses, 'fid': fid_score, 'eval_time': eval_time})
 
         # Periodically save the model
         if save_experiment and step and (step % config.save_every == 0 or step == config.num_steps - 1):
