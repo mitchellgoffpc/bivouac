@@ -6,6 +6,7 @@ pretrained
 experiments
 data/imagenet
 data/atari
+data/csgo
 
 # notebooks
 *.ipynb
