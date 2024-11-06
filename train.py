@@ -2,6 +2,7 @@ import os
 import csv
 import time
 import datetime
+import safetensors
 from pathlib import Path
 from omegaconf import OmegaConf
 from dataclasses import dataclass, field
@@ -53,6 +54,7 @@ class Config:
     model: VQVAEConfig = field(default_factory=VQVAEConfig)
     loss: VQGANLossConfig = field(default_factory=VQGANLossConfig)
     data_path: str = str(Path(__file__).parent / "data/imagenet")
+    checkpoint_path: str | None = None
     save: bool = True
     save_every: int = 2000
     eval_every: int = 2000
@@ -79,6 +81,14 @@ def get_dataloader(config, rank, transform, batch_size, shuffle, split):
     sampler = DistributedSampler(dataset, rank=rank, shuffle=shuffle)
     return DataLoader(dataset, batch_size=batch_size, sampler=sampler, num_workers=config.num_workers)
 
+def combine_state_dicts(state_dicts):
+    return {f'{prefix}.{k}': v.cpu() for prefix, d in state_dicts.items() for k,v in d.state_dict().items()}
+
+def extract_state_dict(f, prefix):
+    return {k.removeprefix(f'{prefix}.'): f.get_tensor(k) for k in f.keys() if k.startswith(f'{prefix}.')}
+
+
+# Training logic
 
 def train(rank, world_size, config, result_path):
     device = torch.device(f'cuda:{rank}')
@@ -91,8 +101,8 @@ def train(rank, world_size, config, result_path):
 
     # Instantiate the model and optimizer
     torch.set_float32_matmul_precision('high')
-    raw_model = VQVAE(config.model).to(device)
-    model = torch.compile(raw_model) if config.compiled else raw_model
+    model = VQVAE(config.model).to(device)
+    model = torch.compile(model) if config.compiled else model
     model = DDP(model, device_ids=[rank])
     g_optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay, betas=(0.5, 0.9))
 
@@ -108,7 +118,7 @@ def train(rank, world_size, config, result_path):
     assert config.batch_size % (config.micro_batch_size * world_size) == 0, "batch_size must be a multiple of micro_batch_size * world_size"
     grad_accum_steps = config.batch_size // (config.micro_batch_size * world_size)
     if rank == 0:
-        for name, submodel in {'Encoder': raw_model.encoder, 'Decoder': raw_model.decoder, 'Total': model}.items():
+        for name, submodel in {'Encoder': model.module.encoder, 'Decoder': model.module.decoder, 'Total': model}.items():
             param_count = sum(p.numel() for p in submodel.parameters())
             print(f"{name} parameters: {param_count:,}")
 
@@ -122,6 +132,14 @@ def train(rank, world_size, config, result_path):
         with open(result_path / 'results.csv', 'w') as f:
             writer = csv.writer(f)
             writer.writerow(['step', 'key', 'value'])
+
+    # Load model checkpoint
+    start_step = 0
+    if config.checkpoint_path:
+        with safetensors.safe_open(config.checkpoint_path, framework="pt") as f:
+            start_step = f.get_tensor('step').item() + 1
+            model.module.load_state_dict(extract_state_dict(f, 'model'))
+            discriminator.module.load_state_dict(extract_state_dict(f, 'discriminator'))
 
 
     # Helper functions
@@ -228,7 +246,7 @@ def train(rank, world_size, config, result_path):
 
     # Training loop
 
-    for step in range(config.num_steps):
+    for step in range(start_step, config.num_steps):
         # Run a single training step
         start_time = time.perf_counter()
         images, _ = next(train_loader)
@@ -265,8 +283,8 @@ def train(rank, world_size, config, result_path):
 
         # Periodically save the model
         if save_experiment and step and (step % config.save_every == 0 or step == config.num_steps - 1):
-            state_dict = {k: v.cpu() for k, v in raw_model.state_dict().items()}
-            save_file(state_dict, result_path / f'checkpoint_{step:06d}.safetensors')
+            state_dict = combine_state_dicts({'model': model.module, 'discriminator': discriminator.module})
+            save_file(state_dict | {'step': torch.tensor(step)}, result_path / f'checkpoint_{step:06d}.safetensors')
 
 
 # Entry point
