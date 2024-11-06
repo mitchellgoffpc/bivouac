@@ -3,16 +3,15 @@ import matplotlib.pyplot as plt
 import torchvision.transforms as T
 from pathlib import Path
 
-from helpers import load_taming_data
-from models.vqvae import VQVAE
+from helpers import load_taming_data, load_sd3_data, load_model
 from datasets.imagenet import ImageNetDataset
 
 
 if __name__ == '__main__':
     device = torch.device('cuda')
-    config, state_dict = load_taming_data()
-    vqgan = VQVAE(config).eval().to(device)
-    vqgan.load_state_dict(state_dict)
+    # config, state_dict = load_taming_data()
+    config, state_dict = load_sd3_data()
+    model = load_model(config, state_dict, device)
 
     transform = T.Compose([
         T.ToTensor(),
@@ -24,7 +23,7 @@ if __name__ == '__main__':
     original = (original * 0.5 + 0.5).clip(0, 1)
 
     with torch.no_grad():
-        result, _ = vqgan(sample[None].to(device))
+        result, _ = model(sample[None].to(device))
         result = result[0].cpu().permute(1, 2, 0).numpy()
         result = (result * 0.5 + 0.5).clip(0, 1)
 

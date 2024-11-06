@@ -3,16 +3,15 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 @dataclass
 class UNetConfig:
     in_channels: int = 3
     z_channels: int = 256
-    base_channels: int = 128
-    channel_mults: tuple = (1, 1, 2, 2, 4)
-    attentions: tuple = (False, False, False, False, True)
-    num_res_blocks: int = 2
+    block_channels: list[int] = field(default_factory=lambda: [128, 128, 256, 256, 512])
+    block_attentions: list[bool] = field(default_factory=lambda: [False, False, False, False, True])
+    layers_per_block: int = 2
     dropout: float = 0.0
     double_z: bool = False
 
@@ -31,12 +30,6 @@ def get_timestep_embedding(timesteps: torch.Tensor, embedding_dim: int) -> torch
 
 def Normalize(in_channels: int) -> nn.GroupNorm:
     return nn.GroupNorm(num_groups=32, num_channels=in_channels, eps=1e-6, affine=True)
-
-def Shortcut(in_channels: int, out_channels: int) -> nn.Module:
-    if in_channels == out_channels:
-        return nn.Identity()
-    else:
-        return nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=1)
 
 
 # Upsample / Downsample
@@ -74,7 +67,7 @@ class ResnetBlock(nn.Module):
         self.norm2 = Normalize(out_channels)
         self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1)
         self.dropout = nn.Dropout(dropout)
-        self.nin_shortcut = Shortcut(in_channels, out_channels)
+        self.nin_shortcut = nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=1) if in_channels != out_channels else nn.Identity()
         if temb_channels > 0:
             self.temb_proj = nn.Linear(temb_channels, out_channels)
 
@@ -168,11 +161,12 @@ class MidBlock(nn.Module):
 class Encoder(nn.Module):
     def __init__(self, config: UNetConfig):
         super().__init__()
-        channels = tuple(mult * config.base_channels for mult in (1, *config.channel_mults))
-        downsamples = [True] * (len(config.channel_mults)-1) + [False]
+        channels = [config.block_channels[0], *config.block_channels]
+        downsamples = [True] * (len(config.block_channels)-1) + [False]
+        attentions = config.block_attentions
 
-        self.conv_in = nn.Conv2d(config.in_channels, config.base_channels, kernel_size=3, stride=1, padding=1)
-        self.down = nn.ModuleList(EncoderBlock(config.num_res_blocks, *args, config.dropout) for args in zip(channels[:-1], channels[1:], config.attentions, downsamples))
+        self.conv_in = nn.Conv2d(config.in_channels, channels[0], kernel_size=3, stride=1, padding=1)
+        self.down = nn.ModuleList(EncoderBlock(config.layers_per_block, *args, config.dropout) for args in zip(channels[:-1], channels[1:], attentions, downsamples))
         self.mid = MidBlock(channels[-1], temb_channels=0, dropout=config.dropout)
         self.norm_out = Normalize(channels[-1])
         self.conv_out = nn.Conv2d(channels[-1], config.z_channels * (2 if config.double_z else 1), kernel_size=3, stride=1, padding=1)
@@ -187,18 +181,19 @@ class Encoder(nn.Module):
 class Decoder(nn.Module):
     def __init__(self, config: UNetConfig):
         super().__init__()
-        channels = tuple(mult * config.base_channels for mult in (*config.channel_mults, config.channel_mults[-1]))
-        upsamples = [False] + [True] * (len(config.channel_mults) - 1)
+        channels = [config.block_channels[-1], *config.block_channels[::-1]]
+        upsamples = [True] * (len(config.block_channels) - 1) + [False]
+        attentions = config.block_attentions[::-1]
 
-        self.conv_in = nn.Conv2d(config.z_channels, channels[-1], kernel_size=3, stride=1, padding=1)
-        self.mid = MidBlock(channels[-1], temb_channels=0, dropout=config.dropout)
-        self.up = nn.ModuleList(DecoderBlock(config.num_res_blocks+1, *args, config.dropout) for args in zip(channels[1:], channels[:-1], config.attentions, upsamples))
-        self.norm_out = Normalize(channels[0])
-        self.conv_out = nn.Conv2d(channels[0], config.in_channels, kernel_size=3, stride=1, padding=1)
+        self.conv_in = nn.Conv2d(config.z_channels, channels[0], kernel_size=3, stride=1, padding=1)
+        self.mid = MidBlock(channels[0], temb_channels=0, dropout=config.dropout)
+        self.up = nn.ModuleList(DecoderBlock(config.layers_per_block+1, *args, config.dropout) for args in zip(channels[:-1], channels[1:], attentions, upsamples))
+        self.norm_out = Normalize(channels[-1])
+        self.conv_out = nn.Conv2d(channels[-1], config.in_channels, kernel_size=3, stride=1, padding=1)
 
     def forward(self, z: torch.Tensor, temb: Optional[torch.Tensor] = None) -> torch.Tensor:
         x = self.conv_in(z)
         x = self.mid(x, temb)
-        for layer in reversed(self.up):
+        for layer in self.up:
             x = layer(x, temb)
         return self.conv_out(F.silu(self.norm_out(x)))
