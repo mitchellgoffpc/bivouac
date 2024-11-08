@@ -81,12 +81,6 @@ def get_dataloader(config, rank, transform, batch_size, shuffle, split):
     sampler = DistributedSampler(dataset, rank=rank, shuffle=shuffle)
     return DataLoader(dataset, batch_size=batch_size, sampler=sampler, num_workers=config.num_workers)
 
-def combine_state_dicts(state_dicts):
-    return {f'{prefix}.{k}': v.cpu() for prefix, d in state_dicts.items() for k,v in d.state_dict().items()}
-
-def extract_state_dict(f, prefix):
-    return {k.removeprefix(f'{prefix}.'): f.get_tensor(k) for k in f.keys() if k.startswith(f'{prefix}.')}
-
 
 # Training logic
 
@@ -138,8 +132,8 @@ def train(rank, world_size, config, result_path):
     if config.checkpoint_path:
         with safetensors.safe_open(config.checkpoint_path, framework="pt") as f:
             start_step = f.get_tensor('step').item() + 1
-            model.module.load_state_dict(extract_state_dict(f, 'model'))
-            discriminator.module.load_state_dict(extract_state_dict(f, 'discriminator'))
+            model.module.load_state_dict({k.removeprefix(f'model.'): f.get_tensor(k) for k in f.keys() if k.startswith(f'model.')})
+            discriminator.module.load_state_dict({k.removeprefix(f'discriminator.'): f.get_tensor(k) for k in f.keys() if k.startswith(f'discriminator.')})
 
 
     # Helper functions
@@ -283,8 +277,9 @@ def train(rank, world_size, config, result_path):
 
         # Periodically save the model
         if save_experiment and step and (step % config.save_every == 0 or step == config.num_steps - 1):
-            state_dict = combine_state_dicts({'model': model.module, 'discriminator': discriminator.module})
-            save_file(state_dict | {'step': torch.tensor(step)}, result_path / f'checkpoint_{step:06d}.safetensors')
+            model_state_dict = {f'model.{k}': v.cpu() for k,v in model.module.state_dict().items()}
+            d_state_dict = {f'discriminator.{k}': v.cpu() for k,v in discriminator.module.state_dict().items()}
+            save_file(model_state_dict | d_state_dict | {'step': torch.tensor(step)}, result_path / f'checkpoint_{step:06d}.safetensors')
 
 
 # Entry point
