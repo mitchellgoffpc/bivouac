@@ -19,6 +19,8 @@ TAMING_MODEL_URL = 'https://heibox.uni-heidelberg.de/d/a7530b09fed84f80a887/file
 TAMING_CONFIG_URL = 'https://heibox.uni-heidelberg.de/d/a7530b09fed84f80a887/files/?p=%2Fconfigs%2Fmodel.yaml&dl=1'
 SD3_MODEL_URL = 'https://huggingface.co/stabilityai/stable-diffusion-3-medium-diffusers/resolve/main/vae/diffusion_pytorch_model.safetensors'
 SD3_CONFIG_URL = 'https://huggingface.co/stabilityai/stable-diffusion-3-medium-diffusers/resolve/main/vae/config.json'
+CSGO_MODEL_URL = 'https://huggingface.co/eloialonso/diamond/resolve/main/csgo/model/csgo.pt'
+CSGO_CONFIG_URL = 'https://huggingface.co/eloialonso/diamond/resolve/main/csgo/config/agent/csgo.yaml'
 
 
 @retry(retry=retry_if_exception_type(requests.exceptions.ChunkedEncodingError), stop=stop_after_attempt(3), reraise=True)
@@ -41,20 +43,14 @@ def fix_state_dict(state_dict: StateDict, replacements: dict[str, str]) -> State
         state_dict = {re.sub(pattern, replacement, k): v for k, v in state_dict.items()}
     return state_dict
 
-def load_model(config: Union['VAEConfig', 'VQVAEConfig', 'DiffusionConfig'], state_dict: StateDict, device: torch.device):
-    from models.vae import VAE, VAEConfig
-    from models.vqvae import VQVAE, VQVAEConfig
-    from models.diffusion import Denoiser, DiffusionConfig
-    torch.set_default_device(device)
-    models = {VQVAEConfig: VQVAE, VAEConfig: VAE, DiffusionConfig: Denoiser}
-    model = models[type(config)](config).eval()
-    model.load_state_dict(state_dict)
-    return model
 
-
-# Load model data
+# Load pretrained models
 
 def load_taming_data() -> tuple['VQVAEConfig', StateDict]:
+    import sys, types  # spoof pytorch lightning for unpickler
+    sys.modules["pytorch_lightning"] = True  # Can be anything
+    sys.modules["pytorch_lightning.callbacks.model_checkpoint"] = types.SimpleNamespace(ModelCheckpoint=None)
+
     from models.vqvae import VQVAEConfig, UNetConfig
     taming_model_path = CHECKPOINT_DIR / 'taming.ckpt'
     taming_config_path = CHECKPOINT_DIR / 'taming.yaml'
@@ -109,3 +105,84 @@ def load_sd3_data() -> tuple['VAEConfig', StateDict]:
     state_dict = fix_state_dict(state_dict, replacements)
     state_dict = {k: v[..., None, None] if re.search(r'attn_1\.(q|k|v|proj_out)\.weight', k) else v for k, v in state_dict.items()}
     return vae_config, state_dict
+
+
+def load_csgo_data() -> tuple['DiffusionConfig', StateDict]:
+    from models.diffusion import DiffusionConfig, UNetConfig
+    csgo_model_path = CHECKPOINT_DIR / 'csgo.ckpt'
+    csgo_config_path = CHECKPOINT_DIR / 'csgo.yaml'
+    download_file(CSGO_MODEL_URL, csgo_model_path)
+    download_file(CSGO_CONFIG_URL, csgo_config_path)
+
+    replacements = {
+        r'denoiser\.': '',
+        r'inner_model\.': '',
+        r'unet\.d_blocks\.': 'encoder.down.',
+        r'unet\.u_blocks\.': 'decoder.up.',
+        r'unet\.mid_blocks\.resblocks\.0\.attn\.': 'encoder.mid.attn_1.',
+        r'unet\.mid_blocks\.resblocks\.1\.attn\.': 'decoder.mid.attn_1.',
+        r'unet\.mid_blocks\.resblocks\.0\.': 'encoder.mid.block_1.',
+        r'unet\.mid_blocks\.resblocks\.1\.': 'decoder.mid.block_1.',
+        r'unet\.downsamples\.(\d)\.': r'encoder.down.\1.downsample.',
+        r'unet\.upsamples\.(\d)\.': r'decoder.up.\1.upsample.',
+        r'\.resblocks\.': '.block.',
+        r'\.out_proj\.': '.proj_out.',
+        r'\.block\.(\d)\.proj\.': r'.block.\1.nin_shortcut.',
+        r'\.block\.(\d)\.attn\.': r'.attn.\1.',
+        r'\.norm\.norm\.': '.norm.',
+        r'^conv_in': 'encoder.conv_in',
+    }
+
+    config = OmegaConf.load(csgo_config_path).denoiser.inner_model
+    unet_config = UNetConfig(
+        in_channels=config.img_channels,
+        z_channels=config.channels[-1],
+        block_channels = config.channels,
+        block_attentions=config.attn_depths,
+        layers_per_block=config.depths[0])
+    diffusion_config = DiffusionConfig(unet=unet_config)
+
+    state_dict = torch.load(csgo_model_path, map_location=torch.device('cpu'), weights_only=True)
+    state_dict = {k:v for k,v in state_dict.items() if k.startswith('denoiser.')}
+    for pattern, replacement in replacements.items():
+        state_dict = {re.sub(pattern, replacement, k): v for k, v in state_dict.items()}
+    for key in list(state_dict.keys()):
+        if '.qkv_proj.' in key:
+            q, k, v = state_dict.pop(key).chunk(3, dim=0)
+            state_dict[key.replace('.qkv_proj.', '.q.')] = q
+            state_dict[key.replace('.qkv_proj.', '.k.')] = k
+            state_dict[key.replace('.qkv_proj.', '.v.')] = v
+        if 'encoder.mid.block_1' in key:
+            state_dict[key.replace('encoder.mid.block_1', 'encoder.mid.block_2')] = torch.zeros_like(state_dict[key])
+        if 'decoder.mid.block_1' in key:
+            state_dict[key.replace('decoder.mid.block_1', 'decoder.mid.block_2')] = torch.zeros_like(state_dict[key])
+
+    return diffusion_config, state_dict
+
+
+# Load model + config
+
+def load_model_data(checkpoint: str) -> tuple[Union['VAEConfig', 'VQVAEConfig', 'DiffusionConfig'], StateDict]:
+    if checkpoint == 'taming':
+        return load_taming_data()
+    elif checkpoint == 'sd3':
+        return load_sd3_data()
+
+    from models.vqvae import VQVAEConfig  # TODO: We should allow other types of configs here
+    checkpoint_path = Path(checkpoint)
+    config_path = path.parent.parent / 'config.yaml'
+    schema = OmegaConf.structured(VQVAEConfig)
+    config = OmegaConf.merge(schema, OmegaConf.load(config_path).model)
+    config = OmegaConf.to_object(config)
+    with safetensors.safe_open(checkpoint_path, framework="pt") as f:
+        state_dict = {k: f.get_tensor(k) for k in f.keys()}
+    return config, state_dict
+
+def load_model(config: Union['VAEConfig', 'VQVAEConfig', 'DiffusionConfig'], state_dict: StateDict, device: torch.device):
+    from models.vae import VAE, VAEConfig
+    from models.vqvae import VQVAE, VQVAEConfig
+    from models.diffusion import Denoiser, DiffusionConfig
+    models = {VQVAEConfig: VQVAE, VAEConfig: VAE, DiffusionConfig: Denoiser}
+    model = models[type(config)](config).eval().to(device)
+    model.load_state_dict(state_dict)
+    return model

@@ -1,16 +1,16 @@
+import sys
 import torch
 import matplotlib.pyplot as plt
 import torchvision.transforms as T
 from pathlib import Path
 
-from helpers import load_taming_data, load_sd3_data, load_model
+from helpers import load_model_data, load_model
 from datasets.imagenet import ImageNetDataset
 
 
 if __name__ == '__main__':
     device = torch.device('cuda')
-    # config, state_dict = load_taming_data()
-    config, state_dict = load_sd3_data()
+    config, state_dict = load_model_data(sys.argv[1])
     model = load_model(config, state_dict, device)
 
     transform = T.Compose([

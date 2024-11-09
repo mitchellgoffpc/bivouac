@@ -119,8 +119,6 @@ def train(rank, world_size, config, result_path):
     # Create results directory and csv file
     save_experiment = config.save and rank == 0
     if save_experiment:
-        code_path = result_path / 'code'
-        code_path.mkdir(parents=True, exist_ok=True)
         with open(result_path / 'config.yaml', 'w') as f:
             f.write(OmegaConf.to_yaml(config))
         with open(result_path / 'results.csv', 'w') as f:
@@ -279,7 +277,7 @@ def train(rank, world_size, config, result_path):
         if save_experiment and step and (step % config.save_every == 0 or step == config.num_steps - 1):
             model_state_dict = {f'model.{k}': v.cpu() for k,v in model.module.state_dict().items()}
             d_state_dict = {f'discriminator.{k}': v.cpu() for k,v in discriminator.module.state_dict().items()}
-            save_file(model_state_dict | d_state_dict | {'step': torch.tensor(step)}, result_path / f'checkpoint_{step:06d}.safetensors')
+            save_file(model_state_dict | d_state_dict | {'step': torch.tensor(step)}, result_path / 'checkpoints' / f'checkpoint_{step:06d}.safetensors')
 
 
 # Entry point

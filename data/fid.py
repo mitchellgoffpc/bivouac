@@ -111,7 +111,7 @@ def calculate_fid(activations1, activations2):
 
 # CLI tool to calculate a model's FID score
 
-def calculate_model_fid(rank, world_size):
+def calculate_model_fid(rank, world_size, checkpoint):
     import time
     import torch
     import torch.distributed as dist
@@ -121,8 +121,7 @@ def calculate_model_fid(rank, world_size):
     from pathlib import Path
     from tqdm import tqdm
 
-    from helpers import load_taming_data
-    from models.vqvae import VQVAE
+    from helpers import load_model_data, load_model
     from datasets.imagenet import ImageNetDataset
 
     # Initialize the distributed environment
@@ -131,9 +130,8 @@ def calculate_model_fid(rank, world_size):
     torch.cuda.set_device(device)
 
     # Load the model
-    config, state_dict = load_taming_data()
-    model = VQVAE(config).to(device).eval()
-    model.load_state_dict(state_dict)
+    config, state_dict = load_model_data(checkpoint)
+    model = load_model(config, state_dict, device)
 
     # Load the ImageNet validation set
     transform = T.Compose([T.Resize(256), T.CenterCrop(256), T.ToTensor()])
@@ -173,13 +171,18 @@ def calculate_model_fid(rank, world_size):
 
 if __name__ == "__main__":
     import os
+    import argparse
     import torch.multiprocessing as mp
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument('checkpoint', type=str)
+    args = parser.parse_args()
 
     os.environ['MASTER_ADDR'] = 'localhost'
     os.environ['MASTER_PORT'] = '12356'
 
     world_size = torch.cuda.device_count()
     if world_size > 1:
-        mp.spawn(calculate_model_fid, args=(world_size,), nprocs=world_size, join=True)
+        mp.spawn(calculate_model_fid, args=(world_size, args.checkpoint), nprocs=world_size, join=True)
     else:
-        calculate_model_fid(0, 1)
+        calculate_model_fid(0, 1, args.checkpoint)
