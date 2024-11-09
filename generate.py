@@ -1,4 +1,4 @@
-import sys
+import argparse
 import torch
 import matplotlib.pyplot as plt
 import torchvision.transforms as T
@@ -9,9 +9,16 @@ from datasets.imagenet import ImageNetDataset
 
 
 if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Generate samples from a model')
+    parser.add_argument('checkpoint', type=str, help='Path to the model checkpoint file')
+    args = parser.parse_args()
+
     device = torch.device('cuda')
-    config, state_dict = load_model_data(sys.argv[1])
+    config, state_dict = load_model_data(args.checkpoint)
     model = load_model(config, state_dict, device)
+
+    param_count = sum(p.numel() for p in model.parameters())
+    print(f"Model Parameters: {param_count:,}")
 
     transform = T.Compose([
         T.ToTensor(),
