@@ -14,9 +14,6 @@ def hinge_d_loss(logits_real, logits_fake):
     loss_fake = F.relu(1. + logits_fake).mean()
     return 0.5 * (loss_real + loss_fake)
 
-def vanilla_d_loss(logits_real, logits_fake):
-    return 0.5 * (F.softplus(-logits_real).mean() + F.softplus(logits_fake).mean())
-
 
 class PatchDiscriminator(nn.Module):
     def __init__(self, num_layers: int = 3, num_channels: int = 64):
@@ -35,23 +32,24 @@ class PatchDiscriminator(nn.Module):
         self.layers = nn.Sequential(*sequence)
         self.apply(init_weights)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.layers(x)
+    def forward(self, real: torch.Tensor, fake: torch.Tensor, rec_loss: torch.Tensor = None, last_layer: nn.Module = None, disc: bool = False) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if disc:
+            return self.d_loss(real, fake)
+        else:
+            return self.g_loss(fake, rec_loss, last_layer)
 
-    def g_loss(self, fake: torch.Tensor, rec_loss: torch.Tensor, last_layer: nn.Module) -> torch.Tensor:
-        g_loss = -torch.mean(self(fake))  # loss goes down when prob_real goes up
+    def g_loss(self, fake: torch.Tensor, rec_loss: torch.Tensor, last_layer: nn.Module) -> tuple[torch.Tensor, torch.Tensor]:
+        g_loss = -torch.mean(self.layers(fake))  # loss goes down when prob_real goes up
         try:
             rec_grads = torch.autograd.grad(rec_loss, last_layer, retain_graph=True)[0]
             g_grads = torch.autograd.grad(g_loss, last_layer, retain_graph=True)[0]
             d_weight = torch.norm(rec_grads) / (torch.norm(g_grads) + 1e-4)
             d_weight = torch.clamp(d_weight, 0.0, 1e4).detach()
-            return d_weight * g_loss
+            return g_loss, d_weight
         except RuntimeError as e:
             raise RuntimeError("last_layer has no grads, make sure you're not running your model with torch.no_grad") from e
 
-    def d_loss(self, real: torch.Tensor, fake: torch.Tensor, loss: str) -> torch.Tensor:
-        d_loss_fns = {'hinge': hinge_d_loss, 'vanilla': vanilla_d_loss}
-        assert loss in d_loss_fns, f'`loss` arg must be one of {d_loss_fns.keys()}'
-        logits_real = self(real.contiguous().detach())
-        logits_fake = self(fake.contiguous().detach())
-        return d_loss_fns[loss](logits_real, logits_fake)
+    def d_loss(self, real: torch.Tensor, fake: torch.Tensor) -> torch.Tensor:
+        logits_real = self.layers(real.contiguous().detach())
+        logits_fake = self.layers(fake.contiguous().detach())
+        return hinge_d_loss(logits_real, logits_fake)

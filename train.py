@@ -1,4 +1,4 @@
-import os
+import os; os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
 import csv
 import time
 import datetime
@@ -41,7 +41,6 @@ class VQGANLossConfig:
     disc_weight: float = 0.75
     disc_num_layers: int = 2
     disc_num_channels: int = 64
-    disc_loss: str = "hinge"
 
 @dataclass
 class Config:
@@ -77,7 +76,15 @@ def all_gather(data, device):
     return torch.cat(output, dim=0)
 
 def get_dataloader(config, rank, transform, batch_size, shuffle, split):
-    dataset = ImageNetDataset(Path(config.data_path), transform=transform, split=split)
+    import sys
+    sys.path.append('/raid.unprotected/taming-transformers')
+    if split == 'train':
+      from taming.data.imagenet import ImageNetTrain
+      dataset = ImageNetTrain({'size': 256})
+    else:
+      from taming.data.imagenet import ImageNetValidation
+      dataset = ImageNetValidation({'size': 256})
+    # dataset = ImageNetDataset(Path(config.data_path), transform=transform, split=split)
     sampler = DistributedSampler(dataset, rank=rank, shuffle=shuffle)
     return DataLoader(dataset, batch_size=batch_size, sampler=sampler, num_workers=config.num_workers)
 
@@ -112,13 +119,14 @@ def train(rank, world_size, config, result_path):
     assert config.batch_size % (config.micro_batch_size * world_size) == 0, "batch_size must be a multiple of micro_batch_size * world_size"
     grad_accum_steps = config.batch_size // (config.micro_batch_size * world_size)
     if rank == 0:
-        for name, submodel in {'Encoder': model.module.encoder, 'Decoder': model.module.decoder, 'Total': model}.items():
+        for name, submodel in {'Encoder': model.module.encoder, 'Decoder': model.module.decoder, 'Total': model.module}.items():
             param_count = sum(p.numel() for p in submodel.parameters())
             print(f"{name} parameters: {param_count:,}")
 
     # Create results directory and csv file
     save_experiment = config.save and rank == 0
     if save_experiment:
+        (result_path / 'checkpoints').mkdir(parents=True, exist_ok=True)
         with open(result_path / 'config.yaml', 'w') as f:
             f.write(OmegaConf.to_yaml(config))
         with open(result_path / 'results.csv', 'w') as f:
@@ -130,8 +138,8 @@ def train(rank, world_size, config, result_path):
     if config.checkpoint_path:
         with safetensors.safe_open(config.checkpoint_path, framework="pt") as f:
             start_step = f.get_tensor('step').item() + 1
-            model.module.load_state_dict({k.removeprefix(f'model.'): f.get_tensor(k) for k in f.keys() if k.startswith(f'model.')})
-            discriminator.module.load_state_dict({k.removeprefix(f'discriminator.'): f.get_tensor(k) for k in f.keys() if k.startswith(f'discriminator.')})
+            model.load_state_dict({k.removeprefix(f'model.'): f.get_tensor(k) for k in f.keys() if k.startswith(f'model.')})
+            discriminator.load_state_dict({k.removeprefix(f'discriminator.'): f.get_tensor(k) for k in f.keys() if k.startswith(f'discriminator.')})
 
 
     # Helper functions
@@ -144,46 +152,48 @@ def train(rank, world_size, config, result_path):
 
     def compute_g_loss(inputs):
         reconstructions, vq_loss = model(inputs)
-        vq_loss = vq_loss / grad_accum_steps
-        l1_loss = torch.abs(inputs.contiguous() - reconstructions.contiguous()).mean() / grad_accum_steps
-        lpips_loss = lpips(inputs.contiguous(), reconstructions.contiguous()).mean() / grad_accum_steps
-        rec_loss = l1_loss + config.loss.lpips_weight * lpips_loss
-        g_loss = discriminator.module.g_loss(reconstructions.contiguous(), rec_loss, model.module.last_layer.weight) / grad_accum_steps
-        loss = rec_loss.mean() + config.loss.disc_weight * g_loss + config.loss.vq_weight * vq_loss.mean()
+        l1_loss = torch.abs(inputs.contiguous() - reconstructions.contiguous())
+        lpips_loss = lpips(inputs.contiguous(), reconstructions.contiguous())
+        rec_loss = torch.mean(l1_loss + config.loss.lpips_weight * lpips_loss)
+        g_loss, d_weight = discriminator(None, reconstructions.contiguous(), rec_loss, model.module.last_layer.weight, disc=False)
+        loss = rec_loss.mean() + config.loss.disc_weight * g_loss * d_weight + config.loss.vq_weight * vq_loss.mean()
         return loss, reconstructions, {'loss': loss, 'vq': vq_loss, 'l1': l1_loss, 'lpips': lpips_loss, 'g': g_loss}
 
     def compute_d_loss(inputs, reconstructions):
-        return discriminator.module.d_loss(inputs.contiguous(), reconstructions.contiguous(), 'hinge') / grad_accum_steps
+        return discriminator(inputs.contiguous(), reconstructions.contiguous(), disc=True)
 
 
     # Training / validation steps
 
     def train_step(images):
         model.train()
+        lpips.train()
         discriminator.train()
         loss_totals = {}
 
         # generator step
         g_optimizer.zero_grad()
         for i in range(grad_accum_steps):
-            inputs = images[i*config.micro_batch_size : (i+1)*config.micro_batch_size] * 2 - 1  # scale to [-1, 1]
+            # inputs = images[i*config.micro_batch_size : (i+1)*config.micro_batch_size] * 2 - 1  # scale to [-1, 1]
+            inputs = images[i*config.micro_batch_size : (i+1)*config.micro_batch_size]
             model.require_backward_grad_sync = (i == grad_accum_steps - 1)
             loss, _, sublosses = compute_g_loss(inputs)
-            loss.backward()
+            (loss / grad_accum_steps).backward()
             for key, value in sublosses.items():
-                loss_totals[key] = loss_totals.get(key, 0) + value.mean().item()
+                loss_totals[key] = loss_totals.get(key, 0) + value.mean().item() / grad_accum_steps
         g_optimizer.step()
 
         # discriminator step
         d_optimizer.zero_grad()
         for i in range(grad_accum_steps):
-            inputs = images[i*config.micro_batch_size : (i+1)*config.micro_batch_size] * 2 - 1
+            # inputs = images[i*config.micro_batch_size : (i+1)*config.micro_batch_size] * 2 - 1
+            inputs = images[i*config.micro_batch_size : (i+1)*config.micro_batch_size]
             discriminator.require_backward_grad_sync = (i == grad_accum_steps - 1)
             with torch.no_grad():
                 reconstructions, _ = model(inputs)
             loss = compute_d_loss(inputs, reconstructions)
-            loss.backward()
-            loss_totals['d'] = loss_totals.get('d', 0) + loss.item()
+            (loss / grad_accum_steps).backward()
+            loss_totals['d'] = loss_totals.get('d', 0) + loss.item() / grad_accum_steps
         d_optimizer.step()
 
         loss_totals = {k: all_reduce(v, device) / world_size for k,v in loss_totals.items()}
@@ -191,10 +201,11 @@ def train(rank, world_size, config, result_path):
 
     def val_step(images):
         model.eval()
+        lpips.eval()
         discriminator.eval()
         model.requires_grad = False
         model.module.last_layer.requires_grad = True  # for gradient computation in g_loss
-        images = images * 2 - 1
+        # images = images * 2 - 1
         _, reconstructions, loss_totals = compute_g_loss(images)
         loss_totals['d'] = compute_d_loss(images, reconstructions)
         loss_totals = {k: all_reduce(v.mean().item(), device) / world_size for k,v in loss_totals.items()}
@@ -205,7 +216,9 @@ def train(rank, world_size, config, result_path):
         loss_totals = {}
         real_activations, fake_activations = [], []
 
-        for step, (images, _) in enumerate(val_loader):
+        # for step, (images, _) in enumerate(val_loader):
+        for step, data in enumerate(val_loader):
+            images = data['image'].permute(0, 3, 1, 2)
             # Compute val losses and activations
             start_time = time.perf_counter()
             images = images.to(device)
@@ -241,7 +254,9 @@ def train(rank, world_size, config, result_path):
     for step in range(start_step, config.num_steps):
         # Run a single training step
         start_time = time.perf_counter()
-        images, _ = next(train_loader)
+        # images, _ = next(train_loader)
+        data = next(train_loader)
+        images = data['image'].permute(0, 3, 1, 2)
         train_losses, reconstructions = train_step(images.to(device))
         step_time = time.perf_counter() - start_time
 
